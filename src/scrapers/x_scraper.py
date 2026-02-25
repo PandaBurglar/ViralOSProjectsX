@@ -113,6 +113,16 @@ def scrape_viral_projects(
         except tweepy.TweepyException as exc:
             print(f"[error] Query failed: {exc}")
             continue
+        except Exception as exc:
+            # Catch network / proxy errors so the bot doesn't crash
+            msg = str(exc)
+            if "Proxy" in msg or "Tunnel" in msg:
+                raise RuntimeError(
+                    "Cannot reach api.twitter.com — a proxy is blocking the "
+                    "connection. Run this bot on a machine with direct internet access."
+                ) from exc
+            print(f"[error] Unexpected error: {exc}")
+            continue
 
         if not response.data:
             continue
