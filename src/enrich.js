@@ -30,6 +30,18 @@ async function enrichProjects(projects, token) {
   const api = ghClient(token);
   const enriched = [];
 
+  // Check rate limit before starting
+  try {
+    const { data, headers } = await api.get("/rate_limit");
+    const remaining = parseInt(headers["x-ratelimit-remaining"] || data?.rate?.remaining, 10);
+    if (remaining < projects.length * 3) {
+      const resetAt = new Date((parseInt(headers["x-ratelimit-reset"], 10) || 0) * 1000);
+      console.warn(`GitHub API rate limit low (${remaining} remaining). Resets at ${resetAt.toISOString()}.`);
+    }
+  } catch {
+    /* non-critical — proceed without rate limit info */
+  }
+
   // Process in small batches to be kind to rate limits
   const BATCH = 5;
   for (let i = 0; i < projects.length; i += BATCH) {
@@ -37,14 +49,14 @@ async function enrichProjects(projects, token) {
     const results = await Promise.allSettled(
       batch.map((p) => enrichOne(api, p))
     );
-    for (const r of results) {
+    results.forEach((r, idx) => {
       if (r.status === "fulfilled") enriched.push(r.value);
       else {
         // If enrichment fails, keep the base project data
-        enriched.push(batch[results.indexOf(r)]);
+        enriched.push(batch[idx]);
         console.warn("Enrichment failed for a project:", r.reason?.message);
       }
-    }
+    });
   }
 
   return enriched;

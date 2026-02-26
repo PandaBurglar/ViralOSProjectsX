@@ -1,15 +1,37 @@
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const cron = require("node-cron");
-const { scrapeTrending } = require("./trending");
+const { searchXForRepos } = require("./x-search");
 const { enrichProjects } = require("./enrich");
-const { createClient, buildThread, postThread, postIndividual } = require("./poster");
+const { generateReport } = require("./report");
 
 // ---------------------------------------------------------------------------
 // Config from environment
 // ---------------------------------------------------------------------------
 
+const DEFAULT_QUERIES = [
+  // URL-based: tweets with a github.com link
+  '"open source" url:"github.com" -is:retweet',
+  '"OSS" url:"github.com" -is:retweet',
+  'url:"github.com" ("just released" OR "just launched" OR "check out" OR "built this" OR "new repo") -is:retweet',
+  'url:"github.com" ("starred" OR "trending" OR "cool project" OR "awesome tool" OR "game changer") -is:retweet',
+  'url:"github.com" ("free tool" OR "self-hosted" OR "just open-sourced") -is:retweet',
+  'url:"github.com" (stars OR "side project" OR "weekend project" OR "new project") -is:retweet',
+  // Name-based: viral tweets about OSS that may NOT have a GitHub link
+  '"open sourced" GitHub -is:retweet -is:reply',
+  '"open source" "GitHub repo" -is:retweet -is:reply',
+  '"just built" "open source" -is:retweet',
+  '"just released" "open source" -is:retweet',
+  '("GitHub repo" OR "on GitHub") ("built" OR "released" OR "launched" OR "created") -is:retweet',
+  '"open source" github -is:retweet -is:reply',
+  '"open sourced" -is:retweet -is:reply',
+  'github ("just built" OR "just launched" OR "just released") -is:retweet',
+];
+
 const config = {
-  // X / Twitter
+  // X / Twitter (for searching)
+  bearerToken: process.env.X_BEARER_TOKEN,
   apiKey: process.env.X_API_KEY,
   apiSecret: process.env.X_API_SECRET,
   accessToken: process.env.X_ACCESS_TOKEN,
@@ -18,135 +40,139 @@ const config = {
   // GitHub
   githubToken: process.env.GITHUB_TOKEN,
 
-  // Bot behaviour
-  cronSchedule: process.env.CRON_SCHEDULE || "0 9 * * *",
-  projectsPerPost: parseInt(process.env.PROJECTS_PER_POST, 10) || 5,
-  trendingPeriod: process.env.TRENDING_PERIOD || "daily",
-  trendingLanguages: process.env.TRENDING_LANGUAGES || "all",
-  postAsThread: process.env.POST_AS_THREAD !== "false",
+  // Search behaviour
+  searchQueries: process.env.SEARCH_QUERIES
+    ? process.env.SEARCH_QUERIES.split("|").map((q) => q.trim())
+    : DEFAULT_QUERIES,
+  maxResults: parseInt(process.env.MAX_RESULTS, 10) || 500,
+  minEngagement: parseInt(process.env.MIN_ENGAGEMENT, 10) || 10,
+  maxProjects: parseInt(process.env.PROJECTS_PER_POST, 10) || 20,
+  defaultDays: parseInt(process.env.DEFAULT_DAYS, 10) || 1,
+
+  // Output
+  workspacePath:
+    process.env.LEADSCRM_WORKSPACE_PATH ||
+    path.join(
+      process.env.HOME || "",
+      "Projects",
+      "LeadsCrm",
+      "workspace",
+      "reports",
+      "viral-oss"
+    ),
+
+  // Scheduling (midnight daily)
+  cronSchedule: process.env.CRON_SCHEDULE || "0 0 * * *",
 };
 
 // ---------------------------------------------------------------------------
-// Main pipeline
-// ---------------------------------------------------------------------------
-
-async function run({ dryRun = false } = {}) {
-  console.log(`\n=== ViralOSProjectsX Bot — ${new Date().toISOString()} ===\n`);
-
-  // 1. Scrape trending projects -----------------------------------------------
-  console.log(
-    `Fetching trending repos (period=${config.trendingPeriod}, lang=${config.trendingLanguages})…`
-  );
-
-  const languages = config.trendingLanguages.split(",").map((l) => l.trim());
-  let allProjects = [];
-
-  for (const lang of languages) {
-    const projects = await scrapeTrending({
-      period: config.trendingPeriod,
-      language: lang,
-      limit: config.projectsPerPost,
-    });
-    allProjects.push(...projects);
-  }
-
-  // Deduplicate by repo URL, keep first occurrence
-  const seen = new Set();
-  allProjects = allProjects.filter((p) => {
-    if (seen.has(p.url)) return false;
-    seen.add(p.url);
-    return true;
-  });
-
-  // Take top N
-  allProjects = allProjects.slice(0, config.projectsPerPost);
-  console.log(`Found ${allProjects.length} trending projects.\n`);
-
-  if (allProjects.length === 0) {
-    console.log("No projects found — skipping post.");
-    return;
-  }
-
-  // 2. Enrich with owner profiles & contact info -----------------------------
-  console.log("Enriching projects with owner & contact data…");
-  const enriched = await enrichProjects(allProjects, config.githubToken);
-
-  // 3. Log summary ------------------------------------------------------------
-  for (const p of enriched) {
-    console.log(`\n--- ${p.name} ---`);
-    console.log(`  URL:          ${p.url}`);
-    console.log(`  Stars:        ${p.stars}  Forks: ${p.forks}  Today: +${p.starsToday}`);
-    console.log(`  Language:     ${p.language}`);
-    console.log(`  Owner:        ${p.ownerName || p.owner} (${p.ownerType || "?"})`);
-    console.log(`  Email:        ${p.ownerEmail || "—"}`);
-    console.log(`  Twitter/X:    ${p.ownerTwitter ? "@" + p.ownerTwitter : "—"}`);
-    console.log(`  LinkedIn:     ${p.linkedIn || "—"}`);
-    console.log(`  Blog/Web:     ${p.ownerBlog || "—"}`);
-    console.log(`  Company:      ${p.ownerCompany || "—"}`);
-    console.log(`  Location:     ${p.ownerLocation || "—"}`);
-    if (p.extraEmails?.length) {
-      console.log(`  README Emails: ${p.extraEmails.join(", ")}`);
-    }
-    if (p.license) console.log(`  License:      ${p.license}`);
-    if (p.topics?.length) console.log(`  Topics:       ${p.topics.join(", ")}`);
-  }
-
-  // 4. Build tweets -----------------------------------------------------------
-  const tweets = buildThread(enriched, config.trendingPeriod);
-
-  if (dryRun) {
-    console.log("\n=== DRY RUN — Tweets that would be posted ===\n");
-    tweets.forEach((t, i) => {
-      console.log(`--- Tweet ${i + 1} (${t.length} chars) ---`);
-      console.log(t);
-      console.log();
-    });
-    return;
-  }
-
-  // 5. Post to X --------------------------------------------------------------
-  if (!config.apiKey || !config.apiSecret || !config.accessToken || !config.accessSecret) {
-    console.error(
-      "\nX/Twitter API credentials not set. Add them to .env — see .env.example."
-    );
-    console.log("Printing tweets to console instead:\n");
-    tweets.forEach((t, i) => {
-      console.log(`--- Tweet ${i + 1} ---`);
-      console.log(t);
-      console.log();
-    });
-    return;
-  }
-
-  console.log("\nPosting to X…");
-  const client = createClient(config);
-
-  if (config.postAsThread) {
-    await postThread(client, tweets);
-  } else {
-    await postIndividual(client, tweets);
-  }
-
-  console.log("\nDone! All tweets posted successfully.");
-}
-
-// ---------------------------------------------------------------------------
-// CLI flags
+// CLI flags (parsed early so run() can access --days)
 // ---------------------------------------------------------------------------
 
 const args = process.argv.slice(2);
 const isDryRun = args.includes("--dry-run");
 const isOnce = args.includes("--once") || isDryRun;
 
+// ---------------------------------------------------------------------------
+// Main pipeline
+// ---------------------------------------------------------------------------
+
+async function run({ dryRun = false } = {}) {
+  const today = new Date().toISOString().slice(0, 10);
+  console.log(`\n=== ViralOSProjectsX — ${today} ===\n`);
+
+  // 1. Search X for tweets mentioning open source GitHub repos ---------------
+  if (!config.bearerToken) {
+    console.error(
+      "X_BEARER_TOKEN not set. Add it to .env — see .env.example."
+    );
+    process.exit(1);
+  }
+
+  // Parse --days flag (default: 1 day for daily runs)
+  const daysArg = args.find((a) => a.startsWith("--days="));
+  const days = daysArg ? parseInt(daysArg.split("=")[1], 10) : config.defaultDays;
+
+  console.log(`Step 1: Searching X for open source repo mentions (last ${days} day${days > 1 ? "s" : ""})…\n`);
+  let repos = await searchXForRepos({
+    bearerToken: config.bearerToken,
+    queries: config.searchQueries,
+    maxResults: config.maxResults,
+    minEngagement: config.minEngagement,
+    days,
+    githubToken: config.githubToken,
+  });
+
+  if (repos.length === 0) {
+    console.log("\nNo validated repos found — skipping report.");
+    return;
+  }
+
+  // Take top N
+  repos = repos.slice(0, config.maxProjects);
+  console.log(`\nTop ${repos.length} repos selected for report.\n`);
+
+  // 2. Enrich with owner profiles & contact info ----------------------------
+  console.log("Step 2: Enriching projects with owner & contact data…\n");
+  const enriched = await enrichProjects(repos, config.githubToken);
+
+  // 3. Cross-reference owner X handles with tweet data ----------------------
+  console.log("Step 3: Cross-referencing owner handles…\n");
+  for (const p of enriched) {
+    if (!p.tweets) continue;
+    const ownerHandle = (p.ownerTwitter || "").toLowerCase();
+
+    for (const t of p.tweets) {
+      // Check if this tweet was posted by the repo owner
+      t.isOwnerTweet =
+        ownerHandle && t.authorUsername.toLowerCase() === ownerHandle;
+
+      // Check if this tweet @mentions the repo owner
+      t.ownerMentionedInTweet =
+        ownerHandle &&
+        !t.isOwnerTweet &&
+        t.mentionedHandles.includes(ownerHandle);
+    }
+  }
+
+  // 4. Log summary to console -----------------------------------------------
+  for (const p of enriched) {
+    const tweetCount = p.tweets?.length || 0;
+    console.log(`  ${p.name} — ${tweetCount} tweets, ${p.totalEngagement} engagement`);
+    console.log(`    Owner: ${p.ownerName || p.owner} | Email: ${p.ownerEmail || "—"} | Twitter: ${p.ownerTwitter ? "@" + p.ownerTwitter : "—"} | LinkedIn: ${p.linkedIn || "—"}`);
+  }
+
+  // 5. Generate report ------------------------------------------------------
+  console.log("\nStep 4: Generating markdown report…\n");
+  const report = generateReport(enriched, today);
+
+  if (dryRun) {
+    console.log("=== DRY RUN — Report Preview ===\n");
+    console.log(report);
+    return;
+  }
+
+  // 6. Save to LeadsCrm workspace -------------------------------------------
+  const outDir = config.workspacePath;
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const outFile = path.join(outDir, `${today}.md`);
+  fs.writeFileSync(outFile, report, "utf-8");
+  console.log(`Report saved to: ${outFile}`);
+  console.log("\nDone!");
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 if (isOnce) {
-  // Run once and exit
   run({ dryRun: isDryRun }).catch((err) => {
     console.error("Bot run failed:", err);
     process.exit(1);
   });
 } else {
-  // Schedule with cron
-  console.log(`Scheduling bot to run on cron: ${config.cronSchedule}`);
+  console.log(`Scheduling daily report on cron: ${config.cronSchedule}`);
   console.log("Waiting for next scheduled run… (Ctrl+C to stop)\n");
 
   cron.schedule(config.cronSchedule, () => {
